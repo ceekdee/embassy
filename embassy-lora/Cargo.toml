@@ -27,5 +27,5 @@ embedded-hal-async = { version = "=0.2.0-alpha.2" }
 embedded-hal = { version = "0.2", features = ["unproven"] }
 
 futures = { version = "0.3.17", default-features = false, features = [ "async-await" ] }
-lora-phy = { version = "1" }
+lora-phy = { version = "2" }
 lorawan-device = { version = "0.10.0", default-features = false, features = ["async"], optional = true }
