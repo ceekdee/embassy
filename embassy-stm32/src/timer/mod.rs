@@ -1,4 +1,5 @@
 pub mod complementary_pwm;
+pub mod qei;
 pub mod simple_pwm;
 
 use stm32_metapac::timer::vals;
@@ -53,6 +54,8 @@ pub(crate) mod sealed {
 
         fn set_output_compare_mode(&mut self, channel: Channel, mode: OutputCompareMode);
 
+        fn set_output_polarity(&mut self, channel: Channel, polarity: OutputPolarity);
+
         fn enable_channel(&mut self, channel: Channel, enable: bool);
 
         fn set_compare_value(&mut self, channel: Channel, value: u16);
@@ -61,6 +64,8 @@ pub(crate) mod sealed {
     }
 
     pub trait ComplementaryCaptureCompare16bitInstance: CaptureCompare16bitInstance {
+        fn set_complementary_output_polarity(&mut self, channel: Channel, polarity: OutputPolarity);
+
         fn set_dead_time_clock_division(&mut self, value: vals::Ckd);
 
         fn set_dead_time_value(&mut self, value: u8);
@@ -70,6 +75,8 @@ pub(crate) mod sealed {
 
     pub trait CaptureCompare32bitInstance: GeneralPurpose32bitInstance {
         fn set_output_compare_mode(&mut self, channel: Channel, mode: OutputCompareMode);
+
+        fn set_output_polarity(&mut self, channel: Channel, polarity: OutputPolarity);
 
         fn enable_channel(&mut self, channel: Channel, enable: bool);
 
@@ -121,6 +128,21 @@ impl From<OutputCompareMode> for stm32_metapac::timer::vals::Ocm {
             OutputCompareMode::ForceActive => stm32_metapac::timer::vals::Ocm::FORCEACTIVE,
             OutputCompareMode::PwmMode1 => stm32_metapac::timer::vals::Ocm::PWMMODE1,
             OutputCompareMode::PwmMode2 => stm32_metapac::timer::vals::Ocm::PWMMODE2,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum OutputPolarity {
+    ActiveHigh,
+    ActiveLow,
+}
+
+impl From<OutputPolarity> for bool {
+    fn from(mode: OutputPolarity) -> Self {
+        match mode {
+            OutputPolarity::ActiveHigh => false,
+            OutputPolarity::ActiveLow => true,
         }
     }
 }
@@ -190,6 +212,7 @@ macro_rules! impl_basic_16bit_timer {
                 use core::convert::TryInto;
                 let f = frequency.0;
                 let timer_f = Self::frequency().0;
+                assert!(f > 0);
                 let pclk_ticks_per_timer_period = timer_f / f;
                 let psc: u16 = unwrap!(((pclk_ticks_per_timer_period - 1) / (1 << 16)).try_into());
                 let arr: u16 = unwrap!((pclk_ticks_per_timer_period / (u32::from(psc) + 1)).try_into());
@@ -234,6 +257,7 @@ macro_rules! impl_32bit_timer {
             fn set_frequency(&mut self, frequency: Hertz) {
                 use core::convert::TryInto;
                 let f = frequency.0;
+                assert!(f > 0);
                 let timer_f = Self::frequency().0;
                 let pclk_ticks_per_timer_period = (timer_f / f) as u64;
                 let psc: u16 = unwrap!(((pclk_ticks_per_timer_period - 1) / (1 << 32)).try_into());
@@ -263,6 +287,13 @@ macro_rules! impl_compare_capable_16bit {
                 let raw_channel: usize = channel.raw();
                 r.ccmr_output(raw_channel / 2)
                     .modify(|w| w.set_ocm(raw_channel % 2, mode.into()));
+            }
+
+            fn set_output_polarity(&mut self, channel: Channel, polarity: OutputPolarity) {
+                use sealed::GeneralPurpose16bitInstance;
+                Self::regs_gp16()
+                    .ccer()
+                    .modify(|w| w.set_ccp(channel.raw(), polarity.into()));
             }
 
             fn enable_channel(&mut self, channel: Channel, enable: bool) {
@@ -323,6 +354,13 @@ foreach_interrupt! {
                 use crate::timer::sealed::GeneralPurpose32bitInstance;
                 let raw_channel = channel.raw();
                 Self::regs_gp32().ccmr_output(raw_channel / 2).modify(|w| w.set_ocm(raw_channel % 2, mode.into()));
+            }
+
+            fn set_output_polarity(&mut self, channel: Channel, polarity: OutputPolarity) {
+                use crate::timer::sealed::GeneralPurpose32bitInstance;
+                Self::regs_gp32()
+                    .ccer()
+                    .modify(|w| w.set_ccp(channel.raw(), polarity.into()));
             }
 
             fn enable_channel(&mut self, channel: Channel, enable: bool) {
@@ -388,6 +426,13 @@ foreach_interrupt! {
                     .modify(|w| w.set_ocm(raw_channel % 2, mode.into()));
             }
 
+            fn set_output_polarity(&mut self, channel: Channel, polarity: OutputPolarity) {
+                use crate::timer::sealed::AdvancedControlInstance;
+                Self::regs_advanced()
+                    .ccer()
+                    .modify(|w| w.set_ccp(channel.raw(), polarity.into()));
+            }
+
             fn enable_channel(&mut self, channel: Channel, enable: bool) {
                 use crate::timer::sealed::AdvancedControlInstance;
                 Self::regs_advanced()
@@ -409,6 +454,13 @@ foreach_interrupt! {
         }
 
         impl sealed::ComplementaryCaptureCompare16bitInstance for crate::peripherals::$inst {
+            fn set_complementary_output_polarity(&mut self, channel: Channel, polarity: OutputPolarity) {
+                use crate::timer::sealed::AdvancedControlInstance;
+                Self::regs_advanced()
+                    .ccer()
+                    .modify(|w| w.set_ccnp(channel.raw(), polarity.into()));
+            }
+
             fn set_dead_time_clock_division(&mut self, value: vals::Ckd) {
                 use crate::timer::sealed::AdvancedControlInstance;
                 Self::regs_advanced().cr1().modify(|w| w.set_ckd(value));

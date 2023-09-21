@@ -1,12 +1,13 @@
 use core::marker::PhantomData;
 
 use embassy_hal_internal::into_ref;
-pub use pll::PllConfig;
+use stm32_metapac::pwr::vals::Vos;
 use stm32_metapac::rcc::vals::{Mco1, Mco2};
 
+pub use self::pll::PllConfig;
 use crate::gpio::sealed::AFType;
 use crate::gpio::Speed;
-use crate::pac::rcc::vals::{Adcsel, Ckpersel, Dppre, Hpre, Hsidiv, Pllsrc, Sw, Timpre};
+use crate::pac::rcc::vals::{Adcsel, Ckpersel, Hpre, Hsidiv, Pllsrc, Ppre, Sw, Timpre};
 use crate::pac::{PWR, RCC, SYSCFG};
 use crate::rcc::{set_freqs, Clocks};
 use crate::time::Hertz;
@@ -24,7 +25,13 @@ pub const HSI48_FREQ: Hertz = Hertz(48_000_000);
 /// LSI speed
 pub const LSI_FREQ: Hertz = Hertz(32_000);
 
-pub use super::common::VoltageScale;
+#[derive(Clone, Copy)]
+pub enum VoltageScale {
+    Scale0,
+    Scale1,
+    Scale2,
+    Scale3,
+}
 
 #[derive(Clone, Copy)]
 pub enum AdcClockSource {
@@ -85,7 +92,6 @@ pub struct CoreClocks {
 
 /// Configuration of the core clocks
 #[non_exhaustive]
-#[derive(Default)]
 pub struct Config {
     pub hse: Option<Hertz>,
     pub bypass_hse: bool,
@@ -100,6 +106,28 @@ pub struct Config {
     pub pll2: PllConfig,
     pub pll3: PllConfig,
     pub adc_clock_source: AdcClockSource,
+    pub voltage_scale: VoltageScale,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            hse: None,
+            bypass_hse: false,
+            sys_ck: None,
+            per_ck: None,
+            hclk: None,
+            pclk1: None,
+            pclk2: None,
+            pclk3: None,
+            pclk4: None,
+            pll1: Default::default(),
+            pll2: Default::default(),
+            pll3: Default::default(),
+            adc_clock_source: Default::default(),
+            voltage_scale: VoltageScale::Scale1,
+        }
+    }
 }
 
 /// Setup traceclk
@@ -200,6 +228,7 @@ fn flash_setup(rcc_aclk: u32, vos: VoltageScale) {
 
     // See RM0433 Rev 7 Table 17. FLASH recommended number of wait
     // states and programming delay
+    #[cfg(flash_h7)]
     let (wait_states, progr_delay) = match vos {
         // VOS 0 range VCORE 1.26V - 1.40V
         VoltageScale::Scale0 => match rcc_aclk_mhz {
@@ -235,6 +264,50 @@ fn flash_setup(rcc_aclk: u32, vos: VoltageScale) {
             90..=134 => (2, 1),
             135..=179 => (3, 2),
             180..=224 => (4, 2),
+            _ => (7, 3),
+        },
+    };
+
+    // See RM0455 Rev 10 Table 16. FLASH recommended number of wait
+    // states and programming delay
+    #[cfg(flash_h7ab)]
+    let (wait_states, progr_delay) = match vos {
+        // VOS 0 range VCORE 1.25V - 1.35V
+        VoltageScale::Scale0 => match rcc_aclk_mhz {
+            0..=42 => (0, 0),
+            43..=84 => (1, 0),
+            85..=126 => (2, 1),
+            127..=168 => (3, 1),
+            169..=210 => (4, 2),
+            211..=252 => (5, 2),
+            253..=280 => (6, 3),
+            _ => (7, 3),
+        },
+        // VOS 1 range VCORE 1.15V - 1.25V
+        VoltageScale::Scale1 => match rcc_aclk_mhz {
+            0..=38 => (0, 0),
+            39..=76 => (1, 0),
+            77..=114 => (2, 1),
+            115..=152 => (3, 1),
+            153..=190 => (4, 2),
+            191..=225 => (5, 2),
+            _ => (7, 3),
+        },
+        // VOS 2 range VCORE 1.05V - 1.15V
+        VoltageScale::Scale2 => match rcc_aclk_mhz {
+            0..=34 => (0, 0),
+            35..=68 => (1, 0),
+            69..=102 => (2, 1),
+            103..=136 => (3, 1),
+            137..=160 => (4, 2),
+            _ => (7, 3),
+        },
+        // VOS 3 range VCORE 0.95V - 1.05V
+        VoltageScale::Scale3 => match rcc_aclk_mhz {
+            0..=22 => (0, 0),
+            23..=44 => (1, 0),
+            45..=66 => (2, 1),
+            67..=88 => (3, 1),
             _ => (7, 3),
         },
     };
@@ -386,22 +459,19 @@ impl<'d, T: McoInstance> Mco<'d, T> {
 }
 
 pub(crate) unsafe fn init(mut config: Config) {
-    // TODO make configurable?
-    let enable_overdrive = false;
-
     // NB. The lower bytes of CR3 can only be written once after
     // POR, and must be written with a valid combination. Refer to
     // RM0433 Rev 7 6.8.4. This is partially enforced by dropping
     // `self` at the end of this method, but of course we cannot
     // know what happened between the previous POR and here.
-    #[cfg(pwr_h7)]
+    #[cfg(pwr_h7rm0433)]
     PWR.cr3().modify(|w| {
         w.set_scuen(true);
         w.set_ldoen(true);
         w.set_bypass(false);
     });
 
-    #[cfg(pwr_h7smps)]
+    #[cfg(any(pwr_h7rm0399, pwr_h7rm0455, pwr_h7rm0468))]
     PWR.cr3().modify(|w| {
         // hardcode "Direct SPMS" for now, this is what works on nucleos with the
         // default solderbridge configuration.
@@ -414,23 +484,53 @@ pub(crate) unsafe fn init(mut config: Config) {
     // in the D3CR.VOS and CR3.SDLEVEL fields. By default after reset
     // VOS = Scale 3, so check that the voltage on the VCAP pins =
     // 1.0V.
+    info!("a");
     while !PWR.csr1().read().actvosrdy() {}
+    info!("b");
 
-    // Go to Scale 1
-    PWR.d3cr().modify(|w| w.set_vos(0b11));
-    while !PWR.d3cr().read().vosrdy() {}
-
-    let pwr_vos = if !enable_overdrive {
-        VoltageScale::Scale1
-    } else {
-        critical_section::with(|_| {
-            RCC.apb4enr().modify(|w| w.set_syscfgen(true));
-
-            SYSCFG.pwrcr().modify(|w| w.set_oden(1));
+    #[cfg(syscfg_h7)]
+    {
+        // in chips without the overdrive bit, we can go from any scale to any scale directly.
+        PWR.d3cr().modify(|w| {
+            w.set_vos(match config.voltage_scale {
+                VoltageScale::Scale0 => Vos::SCALE0,
+                VoltageScale::Scale1 => Vos::SCALE1,
+                VoltageScale::Scale2 => Vos::SCALE2,
+                VoltageScale::Scale3 => Vos::SCALE3,
+            })
         });
         while !PWR.d3cr().read().vosrdy() {}
-        VoltageScale::Scale0
-    };
+    }
+
+    #[cfg(syscfg_h7od)]
+    {
+        match config.voltage_scale {
+            VoltageScale::Scale0 => {
+                // to go to scale0, we must go to Scale1 first...
+                PWR.d3cr().modify(|w| w.set_vos(Vos::SCALE1));
+                while !PWR.d3cr().read().vosrdy() {}
+
+                // Then enable overdrive.
+                critical_section::with(|_| {
+                    RCC.apb4enr().modify(|w| w.set_syscfgen(true));
+                    SYSCFG.pwrcr().modify(|w| w.set_oden(1));
+                });
+                while !PWR.d3cr().read().vosrdy() {}
+            }
+            _ => {
+                // for all other scales, we can go directly.
+                PWR.d3cr().modify(|w| {
+                    w.set_vos(match config.voltage_scale {
+                        VoltageScale::Scale0 => unreachable!(),
+                        VoltageScale::Scale1 => Vos::SCALE1,
+                        VoltageScale::Scale2 => Vos::SCALE2,
+                        VoltageScale::Scale3 => Vos::SCALE3,
+                    })
+                });
+                while !PWR.d3cr().read().vosrdy() {}
+            }
+        }
+    }
 
     // Freeze the core clocks, returning a Core Clocks Distribution
     // and Reset (CCDR) structure. The actual frequency of the clocks
@@ -493,11 +593,11 @@ pub(crate) unsafe fn init(mut config: Config) {
     // Refer to part datasheet "General operating conditions"
     // table for (rev V). We do not assert checks for earlier
     // revisions which may have lower limits.
-    let (sys_d1cpre_ck_max, rcc_hclk_max, pclk_max) = match pwr_vos {
+    let (sys_d1cpre_ck_max, rcc_hclk_max, pclk_max) = match config.voltage_scale {
         VoltageScale::Scale0 => (480_000_000, 240_000_000, 120_000_000),
         VoltageScale::Scale1 => (400_000_000, 200_000_000, 100_000_000),
         VoltageScale::Scale2 => (300_000_000, 150_000_000, 75_000_000),
-        _ => (200_000_000, 100_000_000, 50_000_000),
+        VoltageScale::Scale3 => (200_000_000, 100_000_000, 50_000_000),
     };
     assert!(sys_d1cpre_ck <= sys_d1cpre_ck_max);
 
@@ -537,8 +637,6 @@ pub(crate) unsafe fn init(mut config: Config) {
 
     let requested_pclk4 = config.pclk4.map(|v| v.0).unwrap_or_else(|| pclk_max.min(rcc_hclk / 2));
     let (rcc_pclk4, ppre4_bits, ppre4, _) = ppre_calculate(requested_pclk4, rcc_hclk, pclk_max, None);
-
-    flash_setup(rcc_aclk, pwr_vos);
 
     // Start switching clocks -------------------
 
@@ -588,21 +686,23 @@ pub(crate) unsafe fn init(mut config: Config) {
     // Core Prescaler / AHB Prescaler / APB3 Prescaler
     RCC.d1cfgr().modify(|w| {
         w.set_d1cpre(Hpre::from_bits(d1cpre_bits));
-        w.set_d1ppre(Dppre::from_bits(ppre3_bits));
+        w.set_d1ppre(Ppre::from_bits(ppre3_bits));
         w.set_hpre(hpre_bits)
     });
     // Ensure core prescaler value is valid before future lower
     // core voltage
     while RCC.d1cfgr().read().d1cpre().to_bits() != d1cpre_bits {}
 
+    flash_setup(rcc_aclk, config.voltage_scale);
+
     // APB1 / APB2 Prescaler
     RCC.d2cfgr().modify(|w| {
-        w.set_d2ppre1(Dppre::from_bits(ppre1_bits));
-        w.set_d2ppre2(Dppre::from_bits(ppre2_bits));
+        w.set_d2ppre1(Ppre::from_bits(ppre1_bits));
+        w.set_d2ppre2(Ppre::from_bits(ppre2_bits));
     });
 
     // APB4 Prescaler
-    RCC.d3cfgr().modify(|w| w.set_d3ppre(Dppre::from_bits(ppre4_bits)));
+    RCC.d3cfgr().modify(|w| w.set_d3ppre(Ppre::from_bits(ppre4_bits)));
 
     // Peripheral Clock (per_ck)
     RCC.d1ccipr().modify(|w| w.set_ckpersel(ckpersel));

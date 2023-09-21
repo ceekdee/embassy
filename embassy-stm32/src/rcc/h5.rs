@@ -2,7 +2,6 @@ use core::marker::PhantomData;
 
 use stm32_metapac::rcc::vals::Timpre;
 
-use crate::pac::pwr::vals::Vos;
 use crate::pac::rcc::vals::{Hseext, Hsidiv, Mco1, Mco2, Pllrge, Pllsrc, Pllvcosel, Sw};
 use crate::pac::{FLASH, PWR, RCC};
 use crate::rcc::{set_freqs, Clocks};
@@ -26,7 +25,8 @@ const VCO_MAX: u32 = 420_000_000;
 const VCO_WIDE_MIN: u32 = 128_000_000;
 const VCO_WIDE_MAX: u32 = 560_000_000;
 
-pub use super::common::{AHBPrescaler, APBPrescaler, VoltageScale};
+pub use super::bus::{AHBPrescaler, APBPrescaler};
+pub use crate::pac::pwr::vals::Vos as VoltageScale;
 
 pub enum HseMode {
     /// crystal/ceramic oscillator (HSEBYP=0)
@@ -91,25 +91,25 @@ pub struct Pll {
     pub divr: Option<u16>,
 }
 
-impl APBPrescaler {
-    fn div_tim(&self, clk: Hertz, tim: TimerPrescaler) -> Hertz {
-        match (tim, self) {
-            // The timers kernel clock is equal to rcc_hclk1 if PPRE1 or PPRE2 corresponds to a
-            // division by 1 or 2, else it is equal to 2 x Frcc_pclk1 or 2 x Frcc_pclk2
-            (TimerPrescaler::DefaultX2, Self::NotDivided) => clk,
-            (TimerPrescaler::DefaultX2, Self::Div2) => clk,
-            (TimerPrescaler::DefaultX2, Self::Div4) => clk / 2u32,
-            (TimerPrescaler::DefaultX2, Self::Div8) => clk / 4u32,
-            (TimerPrescaler::DefaultX2, Self::Div16) => clk / 8u32,
-            // The timers kernel clock is equal to 2 x Frcc_pclk1 or 2 x Frcc_pclk2 if PPRE1 or PPRE2
-            // corresponds to a division by 1, 2 or 4, else it is equal to 4 x Frcc_pclk1 or 4 x Frcc_pclk2
-            // this makes NO SENSE and is different than in the H7. Mistake in the RM??
-            (TimerPrescaler::DefaultX4, Self::NotDivided) => clk * 2u32,
-            (TimerPrescaler::DefaultX4, Self::Div2) => clk,
-            (TimerPrescaler::DefaultX4, Self::Div4) => clk / 2u32,
-            (TimerPrescaler::DefaultX4, Self::Div8) => clk / 2u32,
-            (TimerPrescaler::DefaultX4, Self::Div16) => clk / 4u32,
-        }
+fn apb_div_tim(apb: &APBPrescaler, clk: Hertz, tim: TimerPrescaler) -> Hertz {
+    match (tim, apb) {
+        // The timers kernel clock is equal to rcc_hclk1 if PPRE1 or PPRE2 corresponds to a
+        // division by 1 or 2, else it is equal to 2 x Frcc_pclk1 or 2 x Frcc_pclk2
+        (TimerPrescaler::DefaultX2, APBPrescaler::DIV1) => clk,
+        (TimerPrescaler::DefaultX2, APBPrescaler::DIV2) => clk,
+        (TimerPrescaler::DefaultX2, APBPrescaler::DIV4) => clk / 2u32,
+        (TimerPrescaler::DefaultX2, APBPrescaler::DIV8) => clk / 4u32,
+        (TimerPrescaler::DefaultX2, APBPrescaler::DIV16) => clk / 8u32,
+        // The timers kernel clock is equal to 2 x Frcc_pclk1 or 2 x Frcc_pclk2 if PPRE1 or PPRE2
+        // corresponds to a division by 1, 2 or 4, else it is equal to 4 x Frcc_pclk1 or 4 x Frcc_pclk2
+        // this makes NO SENSE and is different than in the H7. Mistake in the RM??
+        (TimerPrescaler::DefaultX4, APBPrescaler::DIV1) => clk * 2u32,
+        (TimerPrescaler::DefaultX4, APBPrescaler::DIV2) => clk,
+        (TimerPrescaler::DefaultX4, APBPrescaler::DIV4) => clk / 2u32,
+        (TimerPrescaler::DefaultX4, APBPrescaler::DIV8) => clk / 2u32,
+        (TimerPrescaler::DefaultX4, APBPrescaler::DIV16) => clk / 4u32,
+
+        _ => unreachable!(),
     }
 }
 
@@ -165,13 +165,13 @@ impl Default for Config {
             #[cfg(rcc_h5)]
             pll3: None,
 
-            ahb_pre: AHBPrescaler::NotDivided,
-            apb1_pre: APBPrescaler::NotDivided,
-            apb2_pre: APBPrescaler::NotDivided,
-            apb3_pre: APBPrescaler::NotDivided,
+            ahb_pre: AHBPrescaler::DIV1,
+            apb1_pre: APBPrescaler::DIV1,
+            apb2_pre: APBPrescaler::DIV1,
+            apb3_pre: APBPrescaler::DIV1,
             timer_prescaler: TimerPrescaler::DefaultX2,
 
-            voltage_scale: VoltageScale::Scale3,
+            voltage_scale: VoltageScale::SCALE3,
         }
     }
 }
@@ -222,15 +222,15 @@ impl<'d, T: McoInstance> Mco<'d, T> {
 }
 
 pub(crate) unsafe fn init(config: Config) {
-    let (vos, max_clk) = match config.voltage_scale {
-        VoltageScale::Scale0 => (Vos::SCALE0, Hertz(250_000_000)),
-        VoltageScale::Scale1 => (Vos::SCALE1, Hertz(200_000_000)),
-        VoltageScale::Scale2 => (Vos::SCALE2, Hertz(150_000_000)),
-        VoltageScale::Scale3 => (Vos::SCALE3, Hertz(100_000_000)),
+    let max_clk = match config.voltage_scale {
+        VoltageScale::SCALE0 => Hertz(250_000_000),
+        VoltageScale::SCALE1 => Hertz(200_000_000),
+        VoltageScale::SCALE2 => Hertz(150_000_000),
+        VoltageScale::SCALE3 => Hertz(100_000_000),
     };
 
     // Configure voltage scale.
-    PWR.voscr().modify(|w| w.set_vos(vos));
+    PWR.voscr().modify(|w| w.set_vos(config.voltage_scale));
     while !PWR.vossr().read().vosrdy() {}
 
     // Configure HSI
@@ -317,9 +317,9 @@ pub(crate) unsafe fn init(config: Config) {
     let hclk = sys / config.ahb_pre;
 
     let apb1 = hclk / config.apb1_pre;
-    let apb1_tim = config.apb1_pre.div_tim(hclk, config.timer_prescaler);
+    let apb1_tim = apb_div_tim(&config.apb1_pre, hclk, config.timer_prescaler);
     let apb2 = hclk / config.apb2_pre;
-    let apb2_tim = config.apb2_pre.div_tim(hclk, config.timer_prescaler);
+    let apb2_tim = apb_div_tim(&config.apb2_pre, hclk, config.timer_prescaler);
     let apb3 = hclk / config.apb3_pre;
 
     flash_setup(hclk, config.voltage_scale);
@@ -472,36 +472,36 @@ fn flash_setup(clk: Hertz, vos: VoltageScale) {
     // See RM0433 Rev 7 Table 17. FLASH recommended number of wait
     // states and programming delay
     let (latency, wrhighfreq) = match (vos, clk.0) {
-        (VoltageScale::Scale0, ..=42_000_000) => (0, 0),
-        (VoltageScale::Scale0, ..=84_000_000) => (1, 0),
-        (VoltageScale::Scale0, ..=126_000_000) => (2, 1),
-        (VoltageScale::Scale0, ..=168_000_000) => (3, 1),
-        (VoltageScale::Scale0, ..=210_000_000) => (4, 2),
-        (VoltageScale::Scale0, ..=250_000_000) => (5, 2),
+        (VoltageScale::SCALE0, ..=42_000_000) => (0, 0),
+        (VoltageScale::SCALE0, ..=84_000_000) => (1, 0),
+        (VoltageScale::SCALE0, ..=126_000_000) => (2, 1),
+        (VoltageScale::SCALE0, ..=168_000_000) => (3, 1),
+        (VoltageScale::SCALE0, ..=210_000_000) => (4, 2),
+        (VoltageScale::SCALE0, ..=250_000_000) => (5, 2),
 
-        (VoltageScale::Scale1, ..=34_000_000) => (0, 0),
-        (VoltageScale::Scale1, ..=68_000_000) => (1, 0),
-        (VoltageScale::Scale1, ..=102_000_000) => (2, 1),
-        (VoltageScale::Scale1, ..=136_000_000) => (3, 1),
-        (VoltageScale::Scale1, ..=170_000_000) => (4, 2),
-        (VoltageScale::Scale1, ..=200_000_000) => (5, 2),
+        (VoltageScale::SCALE1, ..=34_000_000) => (0, 0),
+        (VoltageScale::SCALE1, ..=68_000_000) => (1, 0),
+        (VoltageScale::SCALE1, ..=102_000_000) => (2, 1),
+        (VoltageScale::SCALE1, ..=136_000_000) => (3, 1),
+        (VoltageScale::SCALE1, ..=170_000_000) => (4, 2),
+        (VoltageScale::SCALE1, ..=200_000_000) => (5, 2),
 
-        (VoltageScale::Scale2, ..=30_000_000) => (0, 0),
-        (VoltageScale::Scale2, ..=60_000_000) => (1, 0),
-        (VoltageScale::Scale2, ..=90_000_000) => (2, 1),
-        (VoltageScale::Scale2, ..=120_000_000) => (3, 1),
-        (VoltageScale::Scale2, ..=150_000_000) => (4, 2),
+        (VoltageScale::SCALE2, ..=30_000_000) => (0, 0),
+        (VoltageScale::SCALE2, ..=60_000_000) => (1, 0),
+        (VoltageScale::SCALE2, ..=90_000_000) => (2, 1),
+        (VoltageScale::SCALE2, ..=120_000_000) => (3, 1),
+        (VoltageScale::SCALE2, ..=150_000_000) => (4, 2),
 
-        (VoltageScale::Scale3, ..=20_000_000) => (0, 0),
-        (VoltageScale::Scale3, ..=40_000_000) => (1, 0),
-        (VoltageScale::Scale3, ..=60_000_000) => (2, 1),
-        (VoltageScale::Scale3, ..=80_000_000) => (3, 1),
-        (VoltageScale::Scale3, ..=100_000_000) => (4, 2),
+        (VoltageScale::SCALE3, ..=20_000_000) => (0, 0),
+        (VoltageScale::SCALE3, ..=40_000_000) => (1, 0),
+        (VoltageScale::SCALE3, ..=60_000_000) => (2, 1),
+        (VoltageScale::SCALE3, ..=80_000_000) => (3, 1),
+        (VoltageScale::SCALE3, ..=100_000_000) => (4, 2),
 
         _ => unreachable!(),
     };
 
-    defmt::debug!("flash: latency={} wrhighfreq={}", latency, wrhighfreq);
+    debug!("flash: latency={} wrhighfreq={}", latency, wrhighfreq);
 
     FLASH.acr().write(|w| {
         w.set_wrhighfreq(wrhighfreq);

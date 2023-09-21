@@ -102,7 +102,7 @@ where
         let presc = Prescaler::from_pclk2(T::frequency());
         T::common_regs().ccr().modify(|w| w.set_adcpre(presc.adcpre()));
         T::regs().cr2().modify(|reg| {
-            reg.set_adon(crate::pac::adc::vals::Adon::ENABLED);
+            reg.set_adon(true);
         });
 
         delay.delay_us(ADC_POWERUP_TIME_US);
@@ -125,7 +125,7 @@ where
     /// [Adc::read_internal()] to perform conversion.
     pub fn enable_vrefint(&self) -> VrefInt {
         T::common_regs().ccr().modify(|reg| {
-            reg.set_tsvrefe(crate::pac::adccommon::vals::Tsvrefe::ENABLED);
+            reg.set_tsvrefe(true);
         });
 
         VrefInt {}
@@ -138,7 +138,7 @@ where
     /// temperature sensor will return vbat value.
     pub fn enable_temperature(&self) -> Temperature {
         T::common_regs().ccr().modify(|reg| {
-            reg.set_tsvrefe(crate::pac::adccommon::vals::Tsvrefe::ENABLED);
+            reg.set_tsvrefe(true);
         });
 
         Temperature {}
@@ -148,7 +148,7 @@ where
     /// [Adc::read_internal()] to perform conversion.
     pub fn enable_vbat(&self) -> Vbat {
         T::common_regs().ccr().modify(|reg| {
-            reg.set_vbate(crate::pac::adccommon::vals::Vbate::ENABLED);
+            reg.set_vbate(true);
         });
 
         Vbat {}

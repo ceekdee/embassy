@@ -68,6 +68,28 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         let r = T::regs();
         let s = T::state();
 
+        #[cfg(feature = "nrf52832")]
+        // NRF32 Anomaly 109 workaround... NRF52832
+        if r.intenset.read().started().is_enabled() && r.events_started.read().bits() != 0 {
+            // Handle the first "fake" transmission
+            r.events_started.reset();
+            r.events_end.reset();
+
+            // Update DMA registers with correct rx/tx buffer sizes
+            r.rxd
+                .maxcnt
+                .write(|w| unsafe { w.maxcnt().bits(s.rx.load(Ordering::Relaxed)) });
+            r.txd
+                .maxcnt
+                .write(|w| unsafe { w.maxcnt().bits(s.tx.load(Ordering::Relaxed)) });
+
+            // Disable interrupt for STARTED event...
+            r.intenclr.write(|w| w.started().clear());
+            // ... and start actual, hopefully glitch-free transmission
+            r.tasks_start.write(|w| unsafe { w.bits(1) });
+            return;
+        }
+
         if r.events_end.read().bits() != 0 {
             s.end_waker.wake();
             r.intenclr.write(|w| w.end().clear());
@@ -167,42 +189,10 @@ impl<'d, T: Instance> Spim<'d, T> {
         // Enable SPIM instance.
         r.enable.write(|w| w.enable().enabled());
 
-        // Configure mode.
-        let mode = config.mode;
-        r.config.write(|w| {
-            match mode {
-                MODE_0 => {
-                    w.order().msb_first();
-                    w.cpol().active_high();
-                    w.cpha().leading();
-                }
-                MODE_1 => {
-                    w.order().msb_first();
-                    w.cpol().active_high();
-                    w.cpha().trailing();
-                }
-                MODE_2 => {
-                    w.order().msb_first();
-                    w.cpol().active_low();
-                    w.cpha().leading();
-                }
-                MODE_3 => {
-                    w.order().msb_first();
-                    w.cpol().active_low();
-                    w.cpha().trailing();
-                }
-            }
+        let mut spim = Self { _p: spim };
 
-            w
-        });
-
-        // Configure frequency.
-        let frequency = config.frequency;
-        r.frequency.write(|w| w.frequency().variant(frequency));
-
-        // Set over-read character
-        let orc = config.orc;
-        r.orc.write(|w| unsafe { w.orc().bits(orc) });
+        // Apply runtime peripheral configuration
+        Self::set_config(&mut spim, &config);
 
         // Disable all events interrupts
         r.intenclr.write(|w| unsafe { w.bits(0xFFFF_FFFF) });
@@ -210,7 +200,7 @@ impl<'d, T: Instance> Spim<'d, T> {
         T::Interrupt::unpend();
         unsafe { T::Interrupt::enable() };
 
-        Self { _p: spim }
+        spim
     }
 
     fn prepare(&mut self, rx: *mut [u8], tx: *const [u8]) -> Result<(), Error> {
@@ -223,14 +213,33 @@ impl<'d, T: Instance> Spim<'d, T> {
         let r = T::regs();
 
         // Set up the DMA write.
-        let (ptr, len) = slice_ptr_parts(tx);
+        let (ptr, tx_len) = slice_ptr_parts(tx);
         r.txd.ptr.write(|w| unsafe { w.ptr().bits(ptr as _) });
-        r.txd.maxcnt.write(|w| unsafe { w.maxcnt().bits(len as _) });
+        r.txd.maxcnt.write(|w| unsafe { w.maxcnt().bits(tx_len as _) });
 
         // Set up the DMA read.
-        let (ptr, len) = slice_ptr_parts_mut(rx);
+        let (ptr, rx_len) = slice_ptr_parts_mut(rx);
         r.rxd.ptr.write(|w| unsafe { w.ptr().bits(ptr as _) });
-        r.rxd.maxcnt.write(|w| unsafe { w.maxcnt().bits(len as _) });
+        r.rxd.maxcnt.write(|w| unsafe { w.maxcnt().bits(rx_len as _) });
+
+        // ANOMALY 109 workaround
+        #[cfg(feature = "nrf52832")]
+        {
+            let s = T::state();
+
+            r.events_started.reset();
+
+            // Set rx/tx buffer lengths to 0...
+            r.txd.maxcnt.reset();
+            r.rxd.maxcnt.reset();
+
+            // ...and keep track of original buffer lengths...
+            s.tx.store(tx_len as _, Ordering::Relaxed);
+            s.rx.store(rx_len as _, Ordering::Relaxed);
+
+            // ...signalling the start of the fake transfer.
+            r.intenset.write(|w| w.started().bit(true));
+        }
 
         // Reset and enable the event
         r.events_end.reset();
@@ -378,23 +387,37 @@ impl<'d, T: Instance> Drop for Spim<'d, T> {
         gpio::deconfigure_pin(r.psel.miso.read().bits());
         gpio::deconfigure_pin(r.psel.mosi.read().bits());
 
+        // Disable all events interrupts
+        T::Interrupt::disable();
+
         trace!("spim drop: done");
     }
 }
 
 pub(crate) mod sealed {
+    #[cfg(feature = "nrf52832")]
+    use core::sync::atomic::AtomicU8;
+
     use embassy_sync::waitqueue::AtomicWaker;
 
     use super::*;
 
     pub struct State {
         pub end_waker: AtomicWaker,
+        #[cfg(feature = "nrf52832")]
+        pub rx: AtomicU8,
+        #[cfg(feature = "nrf52832")]
+        pub tx: AtomicU8,
     }
 
     impl State {
         pub const fn new() -> Self {
             Self {
                 end_waker: AtomicWaker::new(),
+                #[cfg(feature = "nrf52832")]
+                rx: AtomicU8::new(0),
+                #[cfg(feature = "nrf52832")]
+                tx: AtomicU8::new(0),
             }
         }
     }

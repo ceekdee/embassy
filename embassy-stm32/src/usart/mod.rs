@@ -5,6 +5,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::Poll;
 
+use embassy_embedded_hal::SetConfig;
 use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{into_ref, PeripheralRef};
 use futures::future::{select, Either};
@@ -168,9 +169,26 @@ pub struct Uart<'d, T: BasicInstance, TxDma = NoDma, RxDma = NoDma> {
     rx: UartRx<'d, T, RxDma>,
 }
 
+impl<'d, T: BasicInstance, TxDma, RxDma> SetConfig for Uart<'d, T, TxDma, RxDma> {
+    type Config = Config;
+
+    fn set_config(&mut self, config: &Self::Config) {
+        self.tx.set_config(config);
+        self.rx.set_config(config);
+    }
+}
+
 pub struct UartTx<'d, T: BasicInstance, TxDma = NoDma> {
     phantom: PhantomData<&'d mut T>,
     tx_dma: PeripheralRef<'d, TxDma>,
+}
+
+impl<'d, T: BasicInstance, TxDma> SetConfig for UartTx<'d, T, TxDma> {
+    type Config = Config;
+
+    fn set_config(&mut self, config: &Self::Config) {
+        self.set_config(config);
+    }
 }
 
 pub struct UartRx<'d, T: BasicInstance, RxDma = NoDma> {
@@ -179,6 +197,14 @@ pub struct UartRx<'d, T: BasicInstance, RxDma = NoDma> {
     detect_previous_overrun: bool,
     #[cfg(any(usart_v1, usart_v2))]
     buffered_sr: stm32_metapac::usart::regs::Sr,
+}
+
+impl<'d, T: BasicInstance, RxDma> SetConfig for UartRx<'d, T, RxDma> {
+    type Config = Config;
+
+    fn set_config(&mut self, config: &Self::Config) {
+        self.set_config(config);
+    }
 }
 
 impl<'d, T: BasicInstance, TxDma> UartTx<'d, T, TxDma> {
@@ -235,6 +261,10 @@ impl<'d, T: BasicInstance, TxDma> UartTx<'d, T, TxDma> {
             tx_dma,
             phantom: PhantomData,
         }
+    }
+
+    pub fn set_config(&mut self, config: &Config) {
+        reconfigure::<T>(config)
     }
 
     pub async fn write(&mut self, buffer: &[u8]) -> Result<(), Error>
@@ -332,6 +362,10 @@ impl<'d, T: BasicInstance, RxDma> UartRx<'d, T, RxDma> {
             #[cfg(any(usart_v1, usart_v2))]
             buffered_sr: stm32_metapac::usart::regs::Sr(0),
         }
+    }
+
+    pub fn set_config(&mut self, config: &Config) {
+        reconfigure::<T>(config)
     }
 
     #[cfg(any(usart_v1, usart_v2))]
@@ -545,6 +579,13 @@ impl<'d, T: BasicInstance, RxDma> UartRx<'d, T, RxDma> {
             unsafe { rdr(r).read_volatile() };
             clear_interrupt_flags(r, sr);
 
+            if enable_idle_line_detection {
+                // enable idle interrupt
+                r.cr1().modify(|w| {
+                    w.set_idleie(true);
+                });
+            }
+
             compiler_fence(Ordering::SeqCst);
 
             let has_errors = sr.pe() || sr.fe() || sr.ne() || sr.ore();
@@ -618,6 +659,18 @@ impl<'d, T: BasicInstance, RxDma> UartRx<'d, T, RxDma> {
     }
 }
 
+impl<'d, T: BasicInstance, TxDma> Drop for UartTx<'d, T, TxDma> {
+    fn drop(&mut self) {
+        T::disable();
+    }
+}
+
+impl<'d, T: BasicInstance, TxDma> Drop for UartRx<'d, T, TxDma> {
+    fn drop(&mut self) {
+        T::disable();
+    }
+}
+
 impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
     pub fn new(
         peri: impl Peripheral<P = T> + 'd,
@@ -628,6 +681,8 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
         rx_dma: impl Peripheral<P = RxDma> + 'd,
         config: Config,
     ) -> Self {
+        // UartRx and UartTx have one refcount ea.
+        T::enable();
         T::enable();
         T::reset();
 
@@ -647,6 +702,8 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
     ) -> Self {
         into_ref!(cts, rts);
 
+        // UartRx and UartTx have one refcount ea.
+        T::enable();
         T::enable();
         T::reset();
 
@@ -672,6 +729,8 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
     ) -> Self {
         into_ref!(de);
 
+        // UartRx and UartTx have one refcount ea.
+        T::enable();
         T::enable();
         T::reset();
 
@@ -734,6 +793,10 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
         }
     }
 
+    pub fn set_config(&mut self, config: &Config) {
+        reconfigure::<T>(config)
+    }
+
     pub async fn write(&mut self, buffer: &[u8]) -> Result<(), Error>
     where
         TxDma: crate::usart::TxDma<T>,
@@ -779,6 +842,17 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
     }
 }
 
+fn reconfigure<T: BasicInstance>(config: &Config) {
+    T::Interrupt::disable();
+    let r = T::regs();
+
+    let cr = r.cr1().read();
+    configure(r, config, T::frequency(), T::KIND, cr.re(), cr.te());
+
+    T::Interrupt::unpend();
+    unsafe { T::Interrupt::enable() };
+}
+
 fn configure(r: Regs, config: &Config, pclk_freq: Hertz, kind: Kind, enable_rx: bool, enable_tx: bool) {
     if !enable_rx && !enable_tx {
         panic!("USART: At least one of RX or TX should be enabled");
@@ -809,45 +883,57 @@ fn configure(r: Regs, config: &Config, pclk_freq: Hertz, kind: Kind, enable_rx: 
         Kind::Uart => (1, 0x10, 0x1_0000),
     };
 
+    fn calculate_brr(baud: u32, pclk: u32, presc: u32, mul: u32) -> u32 {
+        // The calculation to be done to get the BRR is `mul * pclk / presc / baud`
+        // To do this in 32-bit only we can't multiply `mul` and `pclk`
+        let clock = pclk / presc;
+
+        // The mul is applied as the last operation to prevent overflow
+        let brr = clock / baud * mul;
+
+        // The BRR calculation will be a bit off because of integer rounding.
+        // Because we multiplied our inaccuracy with mul, our rounding now needs to be in proportion to mul.
+        let rounding = ((clock % baud) * mul + (baud / 2)) / baud;
+
+        brr + rounding
+    }
+
     #[cfg(not(usart_v1))]
     let mut over8 = false;
-    let mut found = None;
+    let mut found_brr = None;
     for &(presc, _presc_val) in &DIVS {
-        let denom = (config.baudrate * presc as u32) as u64;
-        let div = (pclk_freq.0 as u64 * mul + (denom / 2)) / denom;
+        let brr = calculate_brr(config.baudrate, pclk_freq.0, presc as u32, mul);
         trace!(
             "USART: presc={}, div=0x{:08x} (mantissa = {}, fraction = {})",
             presc,
-            div,
-            div >> 4,
-            div & 0x0F
+            brr,
+            brr >> 4,
+            brr & 0x0F
         );
 
-        if div < brr_min {
+        if brr < brr_min {
             #[cfg(not(usart_v1))]
-            if div * 2 >= brr_min && kind == Kind::Uart && !cfg!(usart_v1) {
+            if brr * 2 >= brr_min && kind == Kind::Uart && !cfg!(usart_v1) {
                 over8 = true;
-                let div = div as u32;
-                r.brr().write_value(regs::Brr(((div << 1) & !0xF) | (div & 0x07)));
+                r.brr().write_value(regs::Brr(((brr << 1) & !0xF) | (brr & 0x07)));
                 #[cfg(usart_v4)]
                 r.presc().write(|w| w.set_prescaler(_presc_val));
-                found = Some(div);
+                found_brr = Some(brr);
                 break;
             }
             panic!("USART: baudrate too high");
         }
 
-        if div < brr_max {
-            let div = div as u32;
-            r.brr().write_value(regs::Brr(div));
+        if brr < brr_max {
+            r.brr().write_value(regs::Brr(brr));
             #[cfg(usart_v4)]
             r.presc().write(|w| w.set_prescaler(_presc_val));
-            found = Some(div);
+            found_brr = Some(brr);
             break;
         }
     }
 
-    let div = found.expect("USART: baudrate too low");
+    let brr = found_brr.expect("USART: baudrate too low");
 
     #[cfg(not(usart_v1))]
     let oversampling = if over8 { "8 bit" } else { "16 bit" };
@@ -857,7 +943,7 @@ fn configure(r: Regs, config: &Config, pclk_freq: Hertz, kind: Kind, enable_rx: 
         "Using {} oversampling, desired baudrate: {}, actual baudrate: {}",
         oversampling,
         config.baudrate,
-        (pclk_freq.0 * mul as u32) / div
+        pclk_freq.0 / brr * mul
     );
 
     r.cr2().write(|w| {
@@ -943,43 +1029,33 @@ mod eh02 {
 mod eh1 {
     use super::*;
 
-    impl embedded_hal_1::serial::Error for Error {
-        fn kind(&self) -> embedded_hal_1::serial::ErrorKind {
+    impl embedded_hal_nb::serial::Error for Error {
+        fn kind(&self) -> embedded_hal_nb::serial::ErrorKind {
             match *self {
-                Self::Framing => embedded_hal_1::serial::ErrorKind::FrameFormat,
-                Self::Noise => embedded_hal_1::serial::ErrorKind::Noise,
-                Self::Overrun => embedded_hal_1::serial::ErrorKind::Overrun,
-                Self::Parity => embedded_hal_1::serial::ErrorKind::Parity,
-                Self::BufferTooLong => embedded_hal_1::serial::ErrorKind::Other,
+                Self::Framing => embedded_hal_nb::serial::ErrorKind::FrameFormat,
+                Self::Noise => embedded_hal_nb::serial::ErrorKind::Noise,
+                Self::Overrun => embedded_hal_nb::serial::ErrorKind::Overrun,
+                Self::Parity => embedded_hal_nb::serial::ErrorKind::Parity,
+                Self::BufferTooLong => embedded_hal_nb::serial::ErrorKind::Other,
             }
         }
     }
 
-    impl<'d, T: BasicInstance, TxDma, RxDma> embedded_hal_1::serial::ErrorType for Uart<'d, T, TxDma, RxDma> {
+    impl<'d, T: BasicInstance, TxDma, RxDma> embedded_hal_nb::serial::ErrorType for Uart<'d, T, TxDma, RxDma> {
         type Error = Error;
     }
 
-    impl<'d, T: BasicInstance, TxDma> embedded_hal_1::serial::ErrorType for UartTx<'d, T, TxDma> {
+    impl<'d, T: BasicInstance, TxDma> embedded_hal_nb::serial::ErrorType for UartTx<'d, T, TxDma> {
         type Error = Error;
     }
 
-    impl<'d, T: BasicInstance, RxDma> embedded_hal_1::serial::ErrorType for UartRx<'d, T, RxDma> {
+    impl<'d, T: BasicInstance, RxDma> embedded_hal_nb::serial::ErrorType for UartRx<'d, T, RxDma> {
         type Error = Error;
     }
 
     impl<'d, T: BasicInstance, RxDma> embedded_hal_nb::serial::Read for UartRx<'d, T, RxDma> {
         fn read(&mut self) -> nb::Result<u8, Self::Error> {
             self.nb_read()
-        }
-    }
-
-    impl<'d, T: BasicInstance, TxDma> embedded_hal_1::serial::Write for UartTx<'d, T, TxDma> {
-        fn write(&mut self, buffer: &[u8]) -> Result<(), Self::Error> {
-            self.blocking_write(buffer)
-        }
-
-        fn flush(&mut self) -> Result<(), Self::Error> {
-            self.blocking_flush()
         }
     }
 
@@ -999,16 +1075,6 @@ mod eh1 {
         }
     }
 
-    impl<'d, T: BasicInstance, TxDma, RxDma> embedded_hal_1::serial::Write for Uart<'d, T, TxDma, RxDma> {
-        fn write(&mut self, buffer: &[u8]) -> Result<(), Self::Error> {
-            self.blocking_write(buffer)
-        }
-
-        fn flush(&mut self) -> Result<(), Self::Error> {
-            self.blocking_flush()
-        }
-    }
-
     impl<'d, T: BasicInstance, TxDma, RxDma> embedded_hal_nb::serial::Write for Uart<'d, T, TxDma, RxDma> {
         fn write(&mut self, char: u8) -> nb::Result<(), Self::Error> {
             self.blocking_write(&[char]).map_err(nb::Error::Other)
@@ -1020,20 +1086,61 @@ mod eh1 {
     }
 }
 
-#[cfg(all(feature = "unstable-traits", feature = "nightly"))]
-mod eio {
-    use embedded_io_async::{ErrorType, Write};
+impl embedded_io::Error for Error {
+    fn kind(&self) -> embedded_io::ErrorKind {
+        embedded_io::ErrorKind::Other
+    }
+}
 
-    use super::*;
+impl<T, TxDma, RxDma> embedded_io::ErrorType for Uart<'_, T, TxDma, RxDma>
+where
+    T: BasicInstance,
+{
+    type Error = Error;
+}
 
-    impl<T, TxDma, RxDma> ErrorType for Uart<'_, T, TxDma, RxDma>
-    where
-        T: BasicInstance,
-    {
-        type Error = Error;
+impl<T, TxDma> embedded_io::ErrorType for UartTx<'_, T, TxDma>
+where
+    T: BasicInstance,
+{
+    type Error = Error;
+}
+
+impl<T, TxDma, RxDma> embedded_io::Write for Uart<'_, T, TxDma, RxDma>
+where
+    T: BasicInstance,
+    TxDma: crate::usart::TxDma<T>,
+{
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.blocking_write(buf)?;
+        Ok(buf.len())
     }
 
-    impl<T, TxDma, RxDma> Write for Uart<'_, T, TxDma, RxDma>
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.blocking_flush()
+    }
+}
+
+impl<T, TxDma> embedded_io::Write for UartTx<'_, T, TxDma>
+where
+    T: BasicInstance,
+    TxDma: crate::usart::TxDma<T>,
+{
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.blocking_write(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.blocking_flush()
+    }
+}
+
+#[cfg(all(feature = "unstable-traits", feature = "nightly"))]
+mod eio {
+    use super::*;
+
+    impl<T, TxDma, RxDma> embedded_io_async::Write for Uart<'_, T, TxDma, RxDma>
     where
         T: BasicInstance,
         TxDma: super::TxDma<T>,
@@ -1048,14 +1155,7 @@ mod eio {
         }
     }
 
-    impl<T, TxDma> ErrorType for UartTx<'_, T, TxDma>
-    where
-        T: BasicInstance,
-    {
-        type Error = Error;
-    }
-
-    impl<T, TxDma> Write for UartTx<'_, T, TxDma>
+    impl<T, TxDma> embedded_io_async::Write for UartTx<'_, T, TxDma>
     where
         T: BasicInstance,
         TxDma: super::TxDma<T>,

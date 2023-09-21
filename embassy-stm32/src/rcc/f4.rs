@@ -8,8 +8,8 @@ use crate::gpio::sealed::AFType;
 use crate::gpio::Speed;
 use crate::pac::rcc::vals::{Hpre, Ppre, Sw};
 use crate::pac::{FLASH, PWR, RCC};
+use crate::rcc::bd::{BackupDomain, RtcClockSource};
 use crate::rcc::{set_freqs, Clocks};
-use crate::rtc::{Rtc, RtcClockSource};
 use crate::time::Hertz;
 use crate::{peripherals, Peripheral};
 
@@ -35,6 +35,8 @@ pub struct Config {
 
     pub pll48: bool,
     pub rtc: Option<RtcClockSource>,
+    pub lsi: bool,
+    pub lse: Option<Hertz>,
 }
 
 #[cfg(stm32f410)]
@@ -461,17 +463,17 @@ pub(crate) unsafe fn init(config: Config) {
         })
     });
 
-    match config.rtc {
-        Some(RtcClockSource::LSI) => {
-            RCC.csr().modify(|w| w.set_lsion(true));
-            while !RCC.csr().read().lsirdy() {}
-        }
-        _ => {}
-    }
+    BackupDomain::configure_ls(
+        config.rtc.unwrap_or(RtcClockSource::NOCLOCK),
+        config.lsi,
+        config.lse.map(|_| Default::default()),
+    );
 
-    config.rtc.map(|clock_source| {
-        Rtc::set_clock_source(clock_source);
-    });
+    let rtc = match config.rtc {
+        Some(RtcClockSource::LSI) => Some(LSI_FREQ),
+        Some(RtcClockSource::LSE) => Some(config.lse.unwrap()),
+        _ => None,
+    };
 
     set_freqs(Clocks {
         sys: Hertz(sysclk),
@@ -492,6 +494,9 @@ pub(crate) unsafe fn init(config: Config) {
 
         #[cfg(any(stm32f427, stm32f429, stm32f437, stm32f439, stm32f446, stm32f469, stm32f479))]
         pllsai: None,
+
+        rtc: rtc,
+        rtc_hse: None,
     });
 }
 

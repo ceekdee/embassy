@@ -29,6 +29,8 @@ pub enum BindError {
 pub enum Error {
     /// No route to host.
     NoRoute,
+    /// Socket not bound to an outgoing port.
+    SocketNotBound,
 }
 
 /// An UDP socket.
@@ -155,7 +157,14 @@ impl<'a> UdpSocket<'a> {
                 s.register_send_waker(cx.waker());
                 Poll::Pending
             }
-            Err(udp::SendError::Unaddressable) => Poll::Ready(Err(Error::NoRoute)),
+            Err(udp::SendError::Unaddressable) => {
+                // If no sender/outgoing port is specified, there is not really "no route"
+                if s.endpoint().port == 0 {
+                    Poll::Ready(Err(Error::SocketNotBound))
+                } else {
+                    Poll::Ready(Err(Error::NoRoute))
+                }
+            }
         })
     }
 
@@ -183,6 +192,26 @@ impl<'a> UdpSocket<'a> {
     /// Returns whether the socket is ready to receive data, i.e. it has received a packet that's now in the buffer.
     pub fn may_recv(&self) -> bool {
         self.with(|s, _| s.can_recv())
+    }
+
+    /// Return the maximum number packets the socket can receive.
+    pub fn packet_recv_capacity(&self) -> usize {
+        self.with(|s, _| s.packet_recv_capacity())
+    }
+
+    /// Return the maximum number packets the socket can receive.
+    pub fn packet_send_capacity(&self) -> usize {
+        self.with(|s, _| s.packet_send_capacity())
+    }
+
+    /// Return the maximum number of bytes inside the recv buffer.
+    pub fn payload_recv_capacity(&self) -> usize {
+        self.with(|s, _| s.payload_recv_capacity())
+    }
+
+    /// Return the maximum number of bytes inside the transmit buffer.
+    pub fn payload_send_capacity(&self) -> usize {
+        self.with(|s, _| s.payload_send_capacity())
     }
 }
 

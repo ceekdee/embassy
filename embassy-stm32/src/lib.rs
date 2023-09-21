@@ -47,6 +47,8 @@ pub mod i2c;
 pub mod i2s;
 #[cfg(stm32wb)]
 pub mod ipcc;
+#[cfg(feature = "low-power")]
+pub mod low_power;
 #[cfg(quadspi)]
 pub mod qspi;
 #[cfg(rng)]
@@ -152,7 +154,7 @@ pub fn init(config: Config) -> Peripherals {
     #[cfg(dbgmcu)]
     if config.enable_debug_during_sleep {
         crate::pac::DBGMCU.cr().modify(|cr| {
-            #[cfg(any(dbgmcu_f0, dbgmcu_c0, dbgmcu_g0, dbgmcu_u5))]
+            #[cfg(any(dbgmcu_f0, dbgmcu_c0, dbgmcu_g0, dbgmcu_u5, dbgmcu_wba))]
             {
                 cr.set_dbg_stop(true);
                 cr.set_dbg_standby(true);
@@ -195,6 +197,11 @@ pub fn init(config: Config) -> Peripherals {
         // must be after rcc init
         #[cfg(feature = "_time-driver")]
         time_driver::init();
+
+        #[cfg(feature = "low-power")]
+        while !crate::rcc::low_power_ready() {
+            crate::rcc::clock_refcount_sub();
+        }
     }
 
     p
